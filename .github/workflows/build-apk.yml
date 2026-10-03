@@ -1,7 +1,8 @@
+# Repo PÚBLICO: solo contiene este workflow.
 # Compila el APK del repo privado y lo devuelve como pre-release al repo privado.
 name: Build APK
 
-run-name: "APK ${{ inputs.flavor }} · ${{ inputs.ref_name }} · ${{ inputs.requested_by }}"
+run-name: "APK ${{ inputs.flavor }} - ${{ inputs.ref_name }} - ${{ inputs.requested_by }}"
 
 on:
   workflow_dispatch:
@@ -34,7 +35,7 @@ jobs:
     timeout-minutes: 60
     env:
       SOURCE_REPO: ${{ vars.SOURCE_REPO }}
-      KEEP_RELEASES: 10
+      # Solo arm64 para APKs de prueba: reduce bastante el tiempo del NDK
       ORG_GRADLE_PROJECT_reactNativeArchitectures: arm64-v8a
 
     steps:
@@ -76,10 +77,10 @@ jobs:
           yes | "$SDKM" --licenses > /dev/null
           PKGS=()
           [ -n "$NDK" ] && PKGS+=("ndk;$NDK")
-          [ -n "$BT" ]  && PKGS+=("build-tools;$BT")
+          [ -n "$BT" ] && PKGS+=("build-tools;$BT")
           [ -n "$SDK" ] && PKGS+=("platforms;android-$SDK")
           echo "Instalando: ${PKGS[*]}"
-          [ ${#PKGS[@]} -gt 0 ] && "$SDKM" "${PKGS[@]}" > /dev/null
+          if [ ${#PKGS[@]} -gt 0 ]; then "$SDKM" "${PKGS[@]}" > /dev/null; fi
 
       - name: Instalar dependencias (incluye postinstall)
         run: npm ci
@@ -93,7 +94,7 @@ jobs:
       - name: Ubicar APK
         id: apk
         run: |
-          APK_PATH=$(find android/app/build/outputs/apk/${{ inputs.flavor }}/release -name "*.apk" | head -n 1)
+          APK_PATH=$(find "android/app/build/outputs/apk/${{ inputs.flavor }}/release" -name "*.apk" | head -n 1)
           if [ -z "$APK_PATH" ]; then echo "No se encontró el APK"; exit 1; fi
           SHORT_SHA=$(echo "${{ inputs.sha }}" | cut -c1-7)
           SAFE_REF=$(echo "${{ inputs.ref_name }}" | tr '/' '-')
@@ -108,17 +109,26 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
         run: |
+          printf 'Rama: %s\nCommit: %s\nFlavor: %s (arm64-v8a, firmado con debug.keystore)\nSolicitado por: @%s\n' \
+            "${{ inputs.ref_name }}" "${{ inputs.sha }}" "${{ inputs.flavor }}" "${{ inputs.requested_by }}" \
+            > "$RUNNER_TEMP/notes.md"
           gh release create "${{ steps.apk.outputs.tag }}" "${{ steps.apk.outputs.file }}" \
             --repo "$SOURCE_REPO" \
             --target "${{ inputs.sha }}" \
             --prerelease \
-            --title "APK ${{ inputs.flavor }} · ${{ inputs.ref_name }} · ${{ steps.apk.outputs.short_sha }}" \
-            --notes "Rama: \`${{ inputs.ref_name }}\`
-          Commit: ${{ inputs.sha }}
-          Flavor: \`${{ inputs.flavor }}\` (arm64-v8a, firmado con debug.keystore)
-          Solicitado por: @${{ inputs.requested_by }}" > /dev/null
+            --title "APK ${{ inputs.flavor }} - ${{ inputs.ref_name }} - ${{ steps.apk.outputs.short_sha }}" \
+            --notes-file "$RUNNER_TEMP/notes.md" > /dev/null
           echo "Pre-release ${{ steps.apk.outputs.tag }} publicado en el repo privado." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Limpiar pre-releases antiguos
+      - name: Limpiar pre-releases antiguos (conserva los 10 más recientes)
         env:
-          GH_TOKEN:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          gh release list --repo "$SOURCE_REPO" --limit 100 --json tagName,isPrerelease,createdAt \
+            --jq '[.[] | select(.isPrerelease and (.tagName | startswith("apk-")))] | sort_by(.createdAt) | reverse | .[10:] | .[].tagName' \
+            > "$RUNNER_TEMP/old_tags.txt"
+          while read -r OLD_TAG; do
+            if [ -n "$OLD_TAG" ]; then
+              gh release delete "$OLD_TAG" --repo "$SOURCE_REPO" --cleanup-tag --yes
+            fi
+          done < "$RUNNER_TEMP/old_tags.txt"
