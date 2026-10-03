@@ -1,0 +1,124 @@
+# Compila el APK del repo privado y lo devuelve como pre-release al repo privado.
+name: Build APK
+
+run-name: "APK ${{ inputs.flavor }} · ${{ inputs.ref_name }} · ${{ inputs.requested_by }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit del repo privado"
+        required: true
+      ref_name:
+        description: "Nombre de la rama (informativo)"
+        required: true
+      flavor:
+        description: "qa | argos"
+        required: true
+        default: "qa"
+      requested_by:
+        description: "Usuario que lo solicitó"
+        required: false
+        default: "manual"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SOURCE_REPO: ${{ vars.SOURCE_REPO }}
+      KEEP_RELEASES: 10
+      ORG_GRADLE_PROJECT_reactNativeArchitectures: arm64-v8a
+
+    steps:
+      - name: Validar flavor
+        run: |
+          case "${{ inputs.flavor }}" in
+            qa)    echo "GRADLE_TASK=assembleQaRelease" >> "$GITHUB_ENV" ;;
+            argos) echo "GRADLE_TASK=assembleArgosRelease" >> "$GITHUB_ENV" ;;
+            *) echo "Flavor inválido: ${{ inputs.flavor }}"; exit 1 ;;
+          esac
+
+      - name: Checkout del repo privado
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Instalar SDK/NDK según android/build.gradle
+        run: |
+          NDK=$(grep -oP 'ndkVersion\s*=\s*"\K[^"]+' android/build.gradle || true)
+          BT=$(grep -oP 'buildToolsVersion\s*=\s*"\K[^"]+' android/build.gradle || true)
+          SDK=$(grep -oP 'compileSdkVersion\s*=\s*\K[0-9]+' android/build.gradle || true)
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null
+          PKGS=()
+          [ -n "$NDK" ] && PKGS+=("ndk;$NDK")
+          [ -n "$BT" ]  && PKGS+=("build-tools;$BT")
+          [ -n "$SDK" ] && PKGS+=("platforms;android-$SDK")
+          echo "Instalando: ${PKGS[*]}"
+          [ ${#PKGS[@]} -gt 0 ] && "$SDKM" "${PKGS[@]}" > /dev/null
+
+      - name: Instalar dependencias (incluye postinstall)
+        run: npm ci
+
+      - name: Compilar APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew "$GRADLE_TASK" --no-daemon --no-problems-report
+
+      - name: Ubicar APK
+        id: apk
+        run: |
+          APK_PATH=$(find android/app/build/outputs/apk/${{ inputs.flavor }}/release -name "*.apk" | head -n 1)
+          if [ -z "$APK_PATH" ]; then echo "No se encontró el APK"; exit 1; fi
+          SHORT_SHA=$(echo "${{ inputs.sha }}" | cut -c1-7)
+          SAFE_REF=$(echo "${{ inputs.ref_name }}" | tr '/' '-')
+          TAG="apk-${{ inputs.flavor }}-${SAFE_REF}-run${{ github.run_number }}"
+          NAME="argos-${{ inputs.flavor }}-${SAFE_REF}-${SHORT_SHA}.apk"
+          cp "$APK_PATH" "$RUNNER_TEMP/$NAME"
+          echo "file=$RUNNER_TEMP/$NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Publicar pre-release en el repo privado
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          gh release create "${{ steps.apk.outputs.tag }}" "${{ steps.apk.outputs.file }}" \
+            --repo "$SOURCE_REPO" \
+            --target "${{ inputs.sha }}" \
+            --prerelease \
+            --title "APK ${{ inputs.flavor }} · ${{ inputs.ref_name }} · ${{ steps.apk.outputs.short_sha }}" \
+            --notes "Rama: \`${{ inputs.ref_name }}\`
+          Commit: ${{ inputs.sha }}
+          Flavor: \`${{ inputs.flavor }}\` (arm64-v8a, firmado con debug.keystore)
+          Solicitado por: @${{ inputs.requested_by }}" > /dev/null
+          echo "Pre-release ${{ steps.apk.outputs.tag }} publicado en el repo privado." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Limpiar pre-releases antiguos
+        env:
+          GH_TOKEN:
