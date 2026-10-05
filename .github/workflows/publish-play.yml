@@ -1,0 +1,147 @@
+# Compila el AAB firmado de ARGOS y lo sube a Play Store (Internal Testing).
+# Usa el environment "play-store": requiere aprobación y solo corre desde main.
+name: Publish Play Store
+
+run-name: "Play Store ${{ inputs.version_name }} - ${{ inputs.requested_by }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Commit del repo privado (rama main)"
+        required: true
+      version_name:
+        description: "Versión visible (ej. 1.0.1)"
+        required: true
+      requested_by:
+        description: "Usuario que lo solicitó"
+        required: false
+        default: "manual"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-play
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: play-store
+    env:
+      SOURCE_REPO: ${{ vars.SOURCE_REPO }}
+      PACKAGE_NAME: com.argoshost.argos
+      PLAY_TRACK: internal
+      # versionCode = 100 + número de ejecución de este workflow (siempre creciente)
+      VERSION_CODE_OFFSET: 100
+
+    steps:
+      - name: Validar versión y calcular versionCode
+        run: |
+          if ! echo "${{ inputs.version_name }}" | grep -Eq '^[0-9]+(\.[0-9]+){1,2}$'; then
+            echo "Versión inválida: '${{ inputs.version_name }}'"; exit 1
+          fi
+          VERSION_CODE=$(( VERSION_CODE_OFFSET + ${{ github.run_number }} ))
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "versionCode: $VERSION_CODE | versionName: ${{ inputs.version_name }}"
+
+      - name: Checkout del repo privado
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Instalar SDK/NDK según android/build.gradle
+        run: |
+          NDK=$(grep -oP 'ndkVersion\s*=\s*"\K[^"]+' android/build.gradle || true)
+          BT=$(grep -oP 'buildToolsVersion\s*=\s*"\K[^"]+' android/build.gradle || true)
+          SDK=$(grep -oP 'compileSdkVersion\s*=\s*\K[0-9]+' android/build.gradle || true)
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null
+          PKGS=()
+          [ -n "$NDK" ] && PKGS+=("ndk;$NDK")
+          [ -n "$BT" ] && PKGS+=("build-tools;$BT")
+          [ -n "$SDK" ] && PKGS+=("platforms;android-$SDK")
+          echo "Instalando: ${PKGS[*]}"
+          if [ ${#PKGS[@]} -gt 0 ]; then "$SDKM" "${PKGS[@]}" > /dev/null; fi
+
+      - name: Instalar dependencias (incluye postinstall)
+        run: npm ci
+
+      - name: Preparar keystore de producción
+        env:
+          PLAY_KEYSTORE_B64: ${{ secrets.PLAY_KEYSTORE_B64 }}
+        run: |
+          echo "$PLAY_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/argos-release.keystore"
+          echo "ARGOS_KEYSTORE_PATH=$RUNNER_TEMP/argos-release.keystore" >> "$GITHUB_ENV"
+
+      # AAB con todas las arquitecturas: Play entrega a cada celular solo la suya.
+      - name: Compilar AAB firmado
+        working-directory: android
+        env:
+          ARGOS_KEYSTORE_PASSWORD: ${{ secrets.PLAY_KEYSTORE_PASSWORD }}
+          ARGOS_KEY_ALIAS: ${{ secrets.PLAY_KEY_ALIAS }}
+          ARGOS_KEY_PASSWORD: ${{ secrets.PLAY_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew bundleArgosRelease \
+            -PappVersionCode="$VERSION_CODE" \
+            -PappVersionName="${{ inputs.version_name }}" \
+            --no-daemon --no-problems-report
+
+      - name: Ubicar AAB
+        id: aab
+        run: |
+          AAB_PATH=$(find android/app/build/outputs/bundle/argosRelease -name "*.aab" | head -n 1)
+          if [ -z "$AAB_PATH" ]; then echo "No se encontró el AAB"; exit 1; fi
+          echo "path=$AAB_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Verificar que el AAB está firmado con la clave de producción
+        run: |
+          OWNER=$(keytool -printcert -jarfile "${{ steps.aab.outputs.path }}" | grep -m1 "Owner:" || true)
+          echo "Firma: $OWNER"
+          if echo "$OWNER" | grep -qi "Android Debug"; then
+            echo "El AAB está firmado con debug.keystore. Abortando."; exit 1
+          fi
+
+      - name: Subir a Play Store (Internal Testing)
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ env.PACKAGE_NAME }}
+          releaseFiles: ${{ steps.aab.outputs.path }}
+          releaseName: "${{ inputs.version_name }} (${{ env.VERSION_CODE }})"
+          track: ${{ env.PLAY_TRACK }}
+          status: completed
+
+      - name: Resumen
+        run: |
+          {
+            echo "### Publicado en Play Store"
+            echo "- Track: \`${PLAY_TRACK}\`"
+            echo "- versionName: \`${{ inputs.version_name }}\`"
+            echo "- versionCode: \`${VERSION_CODE}\`"
+            echo "- Commit: \`${{ inputs.sha }}\`"
+            echo "- Solicitado por: @${{ inputs.requested_by }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Limpiar keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/argos-release.keystore"
