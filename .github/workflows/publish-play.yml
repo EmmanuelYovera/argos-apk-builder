@@ -128,7 +128,7 @@ jobs:
           packageName: ${{ env.PACKAGE_NAME }}
           releaseFiles: ${{ steps.aab.outputs.path }}
           releaseName: "${{ inputs.version_name }} (${{ env.VERSION_CODE }})"
-          track: ${{ env.PLAY_TRACK }}
+          tracks: ${{ env.PLAY_TRACK }}
           status: completed
 
       - name: Resumen
